@@ -42,23 +42,26 @@ async function runInvestigation(payload: z.infer<typeof TaskPayloadSchema>): Pro
     : `Performing a ${input.focus} infrastructure health check.`;
 
   const userPrompt = `
-You are an infrastructure investigator for a homelab Kubernetes cluster.
+You are an infrastructure SRE agent for a homelab Kubernetes cluster.
 ${focusNote}
 
 Your job:
 1. Use the available tools to gather current status (ArgoCD apps, cluster health, Proxmox nodes, recent events)
 2. Identify any problems, degraded services, or anomalies
-3. Write a concise investigation report with:
+3. For clear-cut issues, execute the appropriate low-risk remediation:
+   - ArgoCD OutOfSync → use sync_argocd_app
+   - CrashLoopBackOff / pod failure → use restart_k8s_deployment
+4. Write a concise report with:
    - Overall health: HEALTHY / DEGRADED / CRITICAL
    - Findings (bullet points per system)
-   - Issues found (if any)
-   - Recommended actions (if any)
+   - Actions taken (if any remediation was executed)
+   - Remaining issues or recommended next steps
 
 Focus areas: ${input.focus}
 ${input.eventSource ? `Event source filter: ${input.eventSource}` : ''}
 ${input.eventSeverity ? `Event severity filter: ${input.eventSeverity}` : ''}
 
-Start by gathering the data, then produce the report.
+Start by gathering data, remediate clear-cut issues, then produce the report.
 `.trim();
 
   try {

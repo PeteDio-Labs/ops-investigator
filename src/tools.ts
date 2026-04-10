@@ -6,6 +6,7 @@
 import type { ToolDef } from '@petedio/shared/agents';
 import {
   getArgoApps, getClusterHealth, getProxmoxNodes, getRecentEvents,
+  syncArgoApp, restartDeployment,
   mcHealthy, notifHealthy,
 } from './clients.js';
 
@@ -98,6 +99,45 @@ export function buildTools(): ToolDef[] {
           if (e.timestamp) parts.push(`  at: ${e.timestamp}`);
           return parts.join('\n');
         }).join('\n\n');
+      },
+    },
+
+    {
+      name: 'sync_argocd_app',
+      description: 'Sync an ArgoCD application to resolve sync drift. Use when an app is OutOfSync.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'ArgoCD application name' },
+        },
+        required: ['name'],
+      },
+      async execute(rawArgs) {
+        const args = rawArgs as { name: string };
+        if (!await mcHealthy()) return 'MC Backend unreachable — cannot sync app';
+        const result = await syncArgoApp(args.name);
+        if (result.success) return `Synced ${args.name} successfully.`;
+        return `Sync failed: ${result.error ?? result.message ?? 'unknown error'}`;
+      },
+    },
+
+    {
+      name: 'restart_k8s_deployment',
+      description: 'Restart a Kubernetes deployment to recover from CrashLoopBackOff or pod failures.',
+      parameters: {
+        type: 'object',
+        properties: {
+          namespace: { type: 'string', description: 'Kubernetes namespace' },
+          name: { type: 'string', description: 'Deployment name' },
+        },
+        required: ['namespace', 'name'],
+      },
+      async execute(rawArgs) {
+        const args = rawArgs as { namespace: string; name: string };
+        if (!await mcHealthy()) return 'MC Backend unreachable — cannot restart deployment';
+        const result = await restartDeployment(args.namespace, args.name);
+        if (result.success) return `Restarted ${args.name} in ${args.namespace}.`;
+        return `Restart failed: ${result.error ?? result.message ?? 'unknown error'}`;
       },
     },
   ];

@@ -29,6 +29,17 @@ async function mcGet<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function mcPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${MC_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`MC Backend ${path} → ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
 export async function getArgoApps(): Promise<ArgoApp[]> {
   const data = await mcGet<{ applications: ArgoApp[] }>('/api/v1/argocd/applications');
   return data.applications ?? [];
@@ -36,6 +47,14 @@ export async function getArgoApps(): Promise<ArgoApp[]> {
 
 export async function getClusterHealth(): Promise<Record<string, unknown>> {
   return mcGet('/api/v1/prometheus/cluster/health');
+}
+
+export async function syncArgoApp(name: string): Promise<{ success: boolean; message?: string; error?: string }> {
+  return mcPost(`/api/v1/argocd/applications/${encodeURIComponent(name)}/sync`, {});
+}
+
+export async function restartDeployment(namespace: string, name: string): Promise<{ success: boolean; message?: string; error?: string }> {
+  return mcPost('/api/v1/kubernetes/deployments/restart', { namespace, name });
 }
 
 export async function getProxmoxNodes(): Promise<ProxmoxNode[]> {
