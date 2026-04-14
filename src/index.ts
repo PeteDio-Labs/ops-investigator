@@ -1,7 +1,7 @@
 /**
  * ops-investigator — Infrastructure investigation agent.
  *
- * Accepts a TaskPayload from MC Backend, runs a Gemma 4 tool-calling loop
+ * Accepts a TaskPayload from MC Backend, runs a deterministic step plan
  * over ArgoCD / Prometheus / Proxmox / events, produces an investigation
  * report, and reports back to MC.
  *
@@ -11,22 +11,61 @@
 import express from 'express';
 import pino from 'pino';
 import { z } from 'zod';
-import { AgentReporter, runToolLoop } from '@petedio/shared/agents';
-import { TaskPayloadSchema } from '@petedio/shared/agents';
 import { OpsInvestigatorInputSchema } from './schema.js';
-import { buildTools } from './tools.js';
+import { buildPlan, executeStep, formatReport, type OpsStep, type OpsStepLog } from './tools.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 const PORT = parseInt(process.env.PORT ?? '3005', 10);
-const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://192.168.50.59:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'gemma4';
 const MC_BACKEND_URL = process.env.MC_BACKEND_URL ?? 'http://localhost:3000';
+const SHARED_AGENTS_MODULE_PATH = process.env.SHARED_AGENTS_MODULE_PATH ?? '@petedio/shared/agents';
+
+interface SharedAgentReporter {
+  running(message: string): Promise<void>;
+  complete(result: {
+    taskId: string;
+    agentName: string;
+    status: 'complete';
+    summary: string;
+    artifacts: Array<{ type: string; label: string; content: string }>;
+    durationMs: number;
+    completedAt: string;
+  }): Promise<void>;
+  fail(message: string): Promise<void>;
+}
+
+interface SharedAgentsModule {
+  AgentReporter: new (opts: { mcUrl: string; taskId: string; agentName: string }) => SharedAgentReporter;
+  TaskPayloadSchema: z.ZodType<{
+    taskId: string;
+    agentName: string;
+    trigger: string;
+    input: Record<string, unknown>;
+    issuedAt: string;
+  }>;
+  runDeterministicPlan: (opts: {
+    steps: OpsStep[];
+    executeStep: (step: OpsStep) => Promise<string>;
+    onStepStart?: (step: OpsStep, index: number) => void | Promise<void>;
+    stopOnError?: boolean;
+  }) => Promise<{
+    status: 'complete' | 'failed';
+    logs: OpsStepLog[];
+    completedSteps: number;
+    failedStep?: OpsStepLog;
+  }>;
+}
+
+async function loadSharedAgents(): Promise<SharedAgentsModule> {
+  return import(SHARED_AGENTS_MODULE_PATH) as Promise<SharedAgentsModule>;
+}
 
 // ─── Agent Logic ─────────────────────────────────────────────────
 
-async function runInvestigation(payload: z.infer<typeof TaskPayloadSchema>): Promise<void> {
+async function runInvestigation(payload: { taskId: string; input: Record<string, unknown> }): Promise<void> {
   const startMs = Date.now();
   const input = OpsInvestigatorInputSchema.parse(payload.input);
+  const shared = await loadSharedAgents();
+  const { AgentReporter, runDeterministicPlan } = shared;
 
   const reporter = new AgentReporter({
     mcUrl: MC_BACKEND_URL,
@@ -34,65 +73,47 @@ async function runInvestigation(payload: z.infer<typeof TaskPayloadSchema>): Pro
     agentName: 'ops-investigator',
   });
 
-  await reporter.running('Gathering infrastructure data...');
+  const modeLabel = input.triggerEvent
+    ? `event-driven (${input.triggerEvent.severity}: ${input.triggerEvent.source}/${input.triggerEvent.type})`
+    : input.mode;
+
+  await reporter.running(`Starting ops investigation (${modeLabel})...`);
   log.info({ taskId: payload.taskId, input }, 'ops-investigator starting');
 
-  const focusNote = input.triggerEvent
-    ? `This investigation was triggered by: [${input.triggerEvent.severity.toUpperCase()}] ${input.triggerEvent.source}/${input.triggerEvent.type}: ${input.triggerEvent.message}`
-    : `Performing a ${input.focus} infrastructure health check.`;
-
-  const userPrompt = `
-You are an infrastructure SRE agent for a homelab Kubernetes cluster.
-${focusNote}
-
-Your job:
-1. Use the available tools to gather current status (ArgoCD apps, cluster health, Proxmox nodes, recent events)
-2. Identify any problems, degraded services, or anomalies
-3. For clear-cut issues, execute the appropriate low-risk remediation:
-   - ArgoCD OutOfSync → use sync_argocd_app
-   - CrashLoopBackOff / pod failure → use restart_k8s_deployment
-4. Write a concise report with:
-   - Overall health: HEALTHY / DEGRADED / CRITICAL
-   - Findings (bullet points per system)
-   - Actions taken (if any remediation was executed)
-   - Remaining issues or recommended next steps
-
-Focus areas: ${input.focus}
-${input.eventSource ? `Event source filter: ${input.eventSource}` : ''}
-${input.eventSeverity ? `Event severity filter: ${input.eventSeverity}` : ''}
-
-Start by gathering data, remediate clear-cut issues, then produce the report.
-`.trim();
+  const steps = buildPlan(input);
 
   try {
-    const { finalResponse, toolCallLog, iterations } = await runToolLoop({
-      ollamaUrl: OLLAMA_URL,
-      model: OLLAMA_MODEL,
-      system: 'You are an expert SRE investigating homelab infrastructure. Be concise and factual. Use tools to gather data before forming conclusions.',
-      userPrompt,
-      tools: buildTools(),
-      onIteration: (i, content) => {
-        if (content) log.info({ taskId: payload.taskId, iteration: i }, 'loop response');
+    const result = await runDeterministicPlan({
+      steps,
+      executeStep,
+      onStepStart: async (step, index) => {
+        await reporter.running(`Step ${index + 1}/${steps.length}: ${step.title}`);
       },
     });
 
     const durationMs = Date.now() - startMs;
-    log.info({ taskId: payload.taskId, iterations, durationMs }, 'investigation complete');
+    const report = formatReport(result.logs);
+    const summary = result.failedStep
+      ? `Failed at: ${result.failedStep.step.title}`
+      : `Investigation complete — ${result.completedSteps} step(s) finished`;
 
-    const toolSummary = toolCallLog.length > 0
-      ? `\n\n---\n**Tools used:** ${[...new Set(toolCallLog.map(t => t.tool))].join(', ')}`
-      : '';
+    log.info({ taskId: payload.taskId, durationMs, steps: result.logs.length, status: result.status }, 'investigation complete');
+
+    if (result.status === 'failed') {
+      await reporter.fail(`${summary}\n\n${report}`);
+      return;
+    }
 
     await reporter.complete({
       taskId: payload.taskId,
       agentName: 'ops-investigator',
       status: 'complete',
-      summary: firstLine(finalResponse),
+      summary,
       artifacts: [
         {
           type: 'investigation-report',
           label: 'Infrastructure Investigation Report',
-          content: finalResponse + toolSummary,
+          content: report,
         },
       ],
       durationMs,
@@ -105,16 +126,14 @@ Start by gathering data, remediate clear-cut issues, then produce the report.
   }
 }
 
-function firstLine(text: string): string {
-  return text.split('\n').find(l => l.trim().length > 0) ?? text.slice(0, 100);
-}
-
 // ─── HTTP Server ──────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 
-// MC Backend POSTs here to dispatch a task
+const shared = await loadSharedAgents();
+const { TaskPayloadSchema } = shared;
+
 app.post('/run', async (req, res) => {
   const parsed = TaskPayloadSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -124,16 +143,15 @@ app.post('/run', async (req, res) => {
 
   res.json({ accepted: true, taskId: parsed.data.taskId });
 
-  // Run async — don't await (MC doesn't wait for completion)
   runInvestigation(parsed.data).catch(err => {
     log.error({ err: err instanceof Error ? err.message : err }, 'Unhandled investigation error');
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', agent: 'ops-investigator', model: OLLAMA_MODEL });
+  res.json({ status: 'ok', agent: 'ops-investigator', sharedAgentsModulePath: SHARED_AGENTS_MODULE_PATH });
 });
 
 app.listen(PORT, () => {
-  log.info({ port: PORT, model: OLLAMA_MODEL }, 'ops-investigator listening');
+  log.info({ port: PORT, sharedAgentsModulePath: SHARED_AGENTS_MODULE_PATH }, 'ops-investigator listening');
 });
